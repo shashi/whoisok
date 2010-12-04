@@ -27,8 +27,10 @@ as it handles some complex authentication states that can only be detected
 in client-side code.
 """
 
-FACEBOOK_APP_ID = "your app id"
-FACEBOOK_APP_SECRET = "your app secret"
+import app_keys
+
+FACEBOOK_APP_ID = app_keys.FACEBOOK_APP_ID
+FACEBOOK_APP_SECRET = app_keys.FACEBOOK_APP_SECRET
 
 import base64
 import cgi
@@ -49,14 +51,13 @@ from google.appengine.ext.webapp import util
 from google.appengine.ext.webapp import template
 
 
-class User(db.Model):
+class FacebookUser(db.Model):
     id = db.StringProperty(required=True)
     created = db.DateTimeProperty(auto_now_add=True)
     updated = db.DateTimeProperty(auto_now=True)
     name = db.StringProperty(required=True)
     profile_url = db.StringProperty(required=True)
     access_token = db.StringProperty(required=True)
-
 
 class BaseHandler(webapp.RequestHandler):
     @property
@@ -66,7 +67,7 @@ class BaseHandler(webapp.RequestHandler):
             self._current_user = None
             user_id = parse_cookie(self.request.cookies.get("fb_user"))
             if user_id:
-                self._current_user = User.get_by_key_name(user_id)
+                self._current_user = FacebookUser.get_by_key_name(user_id)
         return self._current_user
 
 
@@ -94,7 +95,7 @@ class LoginHandler(BaseHandler):
             profile = json.load(urllib.urlopen(
                 "https://graph.facebook.com/me?" +
                 urllib.urlencode(dict(access_token=access_token))))
-            user = User(key_name=str(profile["id"]), id=str(profile["id"]),
+            user = FacebookUser(key_name=str(profile["id"]), id=str(profile["id"]),
                         name=profile["name"], access_token=access_token,
                         profile_url=profile["link"])
             user.put()
@@ -124,7 +125,7 @@ def set_cookie(response, name, value, domain=None, path="/", expires=None):
     if domain: cookie[name]["domain"] = domain
     if expires:
         cookie[name]["expires"] = email.utils.formatdate(
-            expires, localtime=False, usegmt=True)
+            expires, localtime=False, usegmt=True)FACEBOOK_APP_ID
     response.headers._headers.append(("Set-Cookie", cookie.output()[12:]))
 
 
