@@ -45,9 +45,9 @@ class WhoIsOkHandler(webapp.RequestHandler):
       data['interpretation'] = time.strftime('%A, %d %B %Y %I:%M%p GMT %z')
     except:
       self.redirect('/?msg=Invalid%20time!')
-    ok = twitter_oauth.who_since(epoch, self)
+    #ok = twitter_oauth.who_since(epoch, self)
 
-    data['people_ok'] = ok
+    #data['people_ok'] = ok
     self.response.out.write(template.render('templates/whoisok.html', data))
     pass
 

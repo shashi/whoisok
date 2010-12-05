@@ -1,3 +1,4 @@
+html {color:#666}
 input {
     outline:none;
     transition: all 0.25s ease-in-out;
@@ -22,3 +23,14 @@ background-color:#e5e5cc}
 div
 {
 border:1px solid;}
+
+a img {border:none}
+
+label {font-size:25px; color:#444}
+p.examples {font-size:12px; color:#777}
+
+center{margin-top: 10%}
+
+h1{font-family: sans;color:#333}
+
+
