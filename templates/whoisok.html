@@ -1,0 +1,8 @@
+<html>
+  <body>
+    <b>Time interpretation: {{interpretation}}</b>
+    {% for url,info in people_ok %}
+      <li><a href="{{url}}"><strong class="name">{{info.name}}</strong></a></li>
+    {% endfor %}
+  </body>
+</html>

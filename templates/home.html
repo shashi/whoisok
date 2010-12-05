@@ -1,11 +1,19 @@
 <html>
   <head><title>WhoIsOk?</title></head>
   <body>
+    {% ifnotequal msg None %}
+    <pre>Error: {{msg}}</pre>
+    {% endifnotequal %}
     <ul>
       Authorize
       <li><a href="/oauth/facebook">Facebook</a></li>
       <li><a href="/oauth/twitter/login">Twitter</a></li>
       <li><a href="/oauth/google/login">Buzz</a></li>
     </ul>
+    <div class="epoch_box">
+      <form method="get" action="/whoisok">
+        <input type="text" name="epoch" />
+      </form>
+    </div>
   </body>
 </html>

@@ -57,6 +57,7 @@ OAUTH_APP_SETTINGS = {
         'request_token_url': 'https://twitter.com/oauth/request_token',
         'access_token_url': 'https://twitter.com/oauth/access_token',
         'user_auth_url': 'http://twitter.com/oauth/authorize',
+	'oauth_callback': 'http://whoisok.appspot.com/oauth/twitter/callback',
 
         'default_api_prefix': 'http://twitter.com',
         'default_api_suffix': '.json',
@@ -414,23 +415,24 @@ def main():
 # -------------------------------------------------------------------------------
 # who has tweeted after an epoch
 # -------------------------------------------------------------------------------
-def who_since(epoch):
+def who_since(epoch, obj):
     """Get a list of users who have tweeted since a time epoch"""
     # plan: use the since GET param and get stream
-    # page tweets 100 at a time
+    # page tweets 200 at a time
     #
     # get all subscriptions
     # find intersection
     # return list(dict(fullname, service, url, status, geo-lat, geo-lons))
+    MAX = 200
     service = 'twitter'
-    client = OAuthClient('twitter', RequestHandler)
+    client = OAuthClient('twitter', obj)
 
-    stream = client.get('/statuses/timeline.json?count=100&since=%s' % str(epoch))
+    stream = client.get('/statuses/home_timeline.json?count=%d&since=%s' % (MAX, str(epoch)))
 
-    while len(stream)>=100:
-        more = client.get('/statuses/timeline.json?count=100&since_id=%s' % str(stream[0]['id']))
+    while len(stream)>=MAX:
+        more = client.get('/statuses/home_timeline.json?count=%d&since_id=%s' % (MAX, str(stream[0]['id'])))
         stream = more + stream
-        if not more or len(more)<100:
+        if not more or len(more)<MAX:
             break
     ok = {}
     for tweet in stream:
