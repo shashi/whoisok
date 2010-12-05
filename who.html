@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:fb="http://www.facebook.com/2008/fbml">
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <title>WhoIsOk</title>
+  </head>
+  <body>
+    <h1>WhoIsOk</h1>
+    <p><fb:login-button autologoutlink="true" perms="friends_online_presence,friends_photo_video_tags,friends_photos,friends_status,friends_videos,friends_checkins"></fb:login-button></p>
+    <p><fb:like></fb:like></p>
+
+    <div id="fb-root"></div>
+    <script>
+      window.fbAsyncInit = function() {
+        FB.init({appId: '172047416150106', status: true, cookie: true, xfbml: true});
+        var queryString = "SELECT uid, name, pic_square FROM user WHERE uid IN (SELECT uid2 FROM friend WHERE uid1 = me())";
+        var query = FB.Data.query(queryString);
+        FB.Data.waitOn([query], function() {
+         var divTarget = document.getElementById('fb-root');
+         FB.Array.forEach(query.value, function(row) {
+           var divContainer = document.createElement("div");
+           divContainer.innerHTML="<hr/><img src='http://graph.facebook.com/" + row.uid + "/picture'></img><br/>" + 
+            row.name;
+           divTarget.appendChild(divContainer);
+         });
+        });         
+      };
+      (function() {
+        var e = document.createElement('script');
+        e.type = 'text/javascript';
+        e.src = 'https://connect.facebook.net/en_US/all.js';//document.location.protocol + '//connect.facebook.net/en_US/all.js';
+        e.async = true;
+        document.getElementById('fb-root').appendChild(e);
+      }());
+    </script>
+  </body>
+</html>

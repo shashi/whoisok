@@ -1,468 +1,442 @@
-#!/usr/bin/env python
+"""
+Twitter OAuth Support for Google App Engine Apps.
+
+Using this in your app should be relatively straightforward:
+
+* Edit the configuration section below with the CONSUMER_KEY and CONSUMER_SECRET
+from Twitter.
+
+* Modify to reflect your App's domain and set the callback URL on Twitter to:
+
+http://your-app-name.appspot.com/oauth/twitter/callback
+
+* Use the demo in ``MainHandler`` as a starting guide to implementing your app.
+
+Note: You need to be running at least version 1.1.9 of the App Engine SDK.
+
+-- 
+I hope you find this useful, tav
 
 """
-A simple OAuth implementation for authenticating users with third party
-websites.
 
-A typical use case inside an AppEngine controller would be:
+# Released into the Public Domain by tav@espians.com
 
-1) Create the OAuth client. In this case we'll use the Twitter client,
-but you could write other clients to connect to different services.
+import sys
 
-import oauth
-
-consumer_key = "LKlkj83kaio2fjiudjd9...etc"
-consumer_secret = "58kdujslkfojkjsjsdk...etc"
-callback_url = "http://www.myurl.com/callback/twitter"
-
-client = oauth.TwitterClient(consumer_key, consumer_secret, callback_url)
-
-2) Send the user to Twitter in order to login:
-
-self.redirect(client.get_authorization_url())
-
-3) Once the user has arrived back at your callback URL, you'll want to
-get the authenticated user information.
-
-auth_token = self.request.get("oauth_token")
-auth_verifier = self.request.get("oauth_verifier")
-user_info = client.get_user_info(auth_token, auth_verifier=auth_verifier)
-
-The "user_info" variable should then contain a dictionary of various
-user information (id, picture url, etc). What you do with that data is up
-to you.
-
-That's it!
-
-4) If you need to, you can also call other other API URLs using
-client.make_request() as long as you supply a valid API URL and an access
-token and secret. Note, you may need to set method=urlfetch.POST.
-
-@author: Mike Knapp
-@copyright: Unrestricted. Feel free to use modify however you see fit. Please
-note however this software is unsupported. Please don't email me about it. :)
-"""
-
-from google.appengine.api import memcache
-from google.appengine.api import urlfetch
-from google.appengine.ext import db
-
-from cgi import parse_qs
-from django.utils import simplejson as json
+from datetime import datetime, timedelta
 from hashlib import sha1
 from hmac import new as hmac
+from os.path import dirname, join as join_path
 from random import getrandbits
 from time import time
-from urllib import urlencode
-from urllib import quote as urlquote
-from urllib import unquote as urlunquote
+from urllib import urlencode, quote as urlquote
+from uuid import uuid4
+from wsgiref.handlers import CGIHandler
 
-import logging
+sys.path.insert(0, join_path(dirname(__file__), 'lib')) # extend sys.path
 
+from demjson import decode as decode_json
 
-class OAuthException(Exception):
+from google.appengine.api.urlfetch import fetch as urlfetch, GET, POST
+from google.appengine.ext import db
+from google.appengine.ext.webapp import RequestHandler, WSGIApplication
+
+# ------------------------------------------------------------------------------
+# configuration -- SET THESE TO SUIT YOUR APP!!
+# ------------------------------------------------------------------------------
+
+import app_keys
+
+OAUTH_APP_SETTINGS = {
+
+    'twitter': {
+
+        'consumer_key': app_keys.TWITTER_APP_ID,
+        'consumer_secret': app_keys.TWITTER_APP_SECRET,
+
+        'request_token_url': 'https://twitter.com/oauth/request_token',
+        'access_token_url': 'https://twitter.com/oauth/access_token',
+        'user_auth_url': 'http://twitter.com/oauth/authorize',
+
+        'default_api_prefix': 'http://twitter.com',
+        'default_api_suffix': '.json',
+
+        },
+
+    'google': {
+
+        'consumer_key': '',
+        'consumer_secret': '',
+
+        'request_token_url': 'https://www.google.com/accounts/OAuthGetRequestToken',
+        'access_token_url': 'https://www.google.com/accounts/OAuthGetAccessToken',
+        'user_auth_url': 'https://www.google.com/accounts/OAuthAuthorizeToken',
+
+        },
+
+    }
+
+CLEANUP_BATCH_SIZE = 100
+EXPIRATION_WINDOW = timedelta(seconds=60*60*1) # 1 hour
+
+try:
+    from config import OAUTH_APP_SETTINGS
+except:
     pass
 
+STATIC_OAUTH_TIMESTAMP = 12345 # a workaround for clock skew/network lag
 
-def get_oauth_client(service, key, secret, callback_url):
-  """Get OAuth Client.
+# ------------------------------------------------------------------------------
+# utility functions
+# ------------------------------------------------------------------------------
 
-A factory that will return the appropriate OAuth client.
+def get_service_key(service, cache={}):
+    if service in cache: return cache[service]
+    return cache.setdefault(
+        service, "%s&" % encode(OAUTH_APP_SETTINGS[service]['consumer_secret'])
+        )
+
+def create_uuid():
+    return 'id-%s' % uuid4()
+
+def encode(text):
+    return urlquote(str(text), '')
+
+def twitter_specifier_handler(client):
+    return client.get('/account/verify_credentials')['screen_name']
+
+OAUTH_APP_SETTINGS['twitter']['specifier_handler'] = twitter_specifier_handler
+
+# ------------------------------------------------------------------------------
+# db entities
+# ------------------------------------------------------------------------------
+
+class OAuthRequestToken(db.Model):
+    """OAuth Request Token."""
+
+    service = db.StringProperty()
+    oauth_token = db.StringProperty()
+    oauth_token_secret = db.StringProperty()
+    created = db.DateTimeProperty(auto_now_add=True)
+
+class OAuthAccessToken(db.Model):
+    """OAuth Access Token."""
+
+    service = db.StringProperty()
+    specifier = db.StringProperty()
+    oauth_token = db.StringProperty()
+    oauth_token_secret = db.StringProperty()
+    created = db.DateTimeProperty(auto_now_add=True)
+
+# ------------------------------------------------------------------------------
+# oauth client
+# ------------------------------------------------------------------------------
+
+class OAuthClient(object):
+
+    __public__ = ('callback', 'cleanup', 'login', 'logout')
+
+    def __init__(self, service, handler, oauth_callback=None, **request_params):
+        self.service = service
+        self.service_info = OAUTH_APP_SETTINGS[service]
+        self.service_key = None
+        self.handler = handler
+        self.request_params = request_params
+        self.oauth_callback = oauth_callback
+        self.token = None
+
+    # public methods
+
+    def get(self, api_method, http_method='GET', expected_status=(200,), **extra_params):
+
+        if not (api_method.startswith('http://') or api_method.startswith('https://')):
+            api_method = '%s%s%s' % (
+                self.service_info['default_api_prefix'], api_method,
+                self.service_info['default_api_suffix']
+                )
+
+        if self.token is None:
+            self.token = OAuthAccessToken.get_by_key_name(self.get_cookie())
+
+        fetch = urlfetch(self.get_signed_url(
+            api_method, self.token, http_method, **extra_params
+            ))
+
+        if fetch.status_code not in expected_status:
+            raise ValueError(
+                "Error calling... Got return status: %i [%r]" %
+                (fetch.status_code, fetch.content)
+                )
+
+        return decode_json(fetch.content)
+
+    def post(self, api_method, http_method='POST', expected_status=(200,), **extra_params):
+
+        if not (api_method.startswith('http://') or api_method.startswith('https://')):
+            api_method = '%s%s%s' % (
+                self.service_info['default_api_prefix'], api_method,
+                self.service_info['default_api_suffix']
+                )
+
+        if self.token is None:
+            self.token = OAuthAccessToken.get_by_key_name(self.get_cookie())
+
+        fetch = urlfetch(url=api_method, payload=self.get_signed_body(
+            api_method, self.token, http_method, **extra_params
+            ), method=http_method)
+
+        if fetch.status_code not in expected_status:
+            raise ValueError(
+                "Error calling... Got return status: %i [%r]" %
+                (fetch.status_code, fetch.content)
+                )
+
+        return decode_json(fetch.content)
+
+    def login(self):
+
+        proxy_id = self.get_cookie()
+
+        if proxy_id:
+            return "FOO%rFF" % proxy_id
+            self.expire_cookie()
+
+        return self.get_request_token()
+
+    def logout(self, return_to='/'):
+        self.expire_cookie()
+        self.handler.redirect(self.handler.request.get("return_to", return_to))
+
+    # oauth workflow
+
+    def get_request_token(self):
+
+        token_info = self.get_data_from_signed_url(
+            self.service_info['request_token_url'], **self.request_params
+            )
+
+        token = OAuthRequestToken(
+            service=self.service,
+            **dict(token.split('=') for token in token_info.split('&'))
+            )
+
+        token.put()
+
+        if self.oauth_callback:
+            oauth_callback = {'oauth_callback': self.oauth_callback}
+        else:
+            oauth_callback = {}
+
+        self.handler.redirect(self.get_signed_url(
+            self.service_info['user_auth_url'], token, **oauth_callback
+            ))
+
+    def callback(self, return_to='/'):
+
+        oauth_token = self.handler.request.get("oauth_token")
+
+        if not oauth_token:
+            return get_request_token()
+
+        oauth_token = OAuthRequestToken.all().filter(
+            'oauth_token =', oauth_token).filter(
+            'service =', self.service).fetch(1)[0]
+
+        token_info = self.get_data_from_signed_url(
+            self.service_info['access_token_url'], oauth_token
+            )
+
+        key_name = create_uuid()
+
+        self.token = OAuthAccessToken(
+            key_name=key_name, service=self.service,
+            **dict(token.split('=') for token in token_info.split('&'))
+            )
+
+        if 'specifier_handler' in self.service_info:
+            specifier = self.token.specifier = self.service_info['specifier_handler'](self)
+            old = OAuthAccessToken.all().filter(
+                'specifier =', specifier).filter(
+                'service =', self.service)
+            db.delete(old)
+
+        self.token.put()
+        self.set_cookie(key_name)
+        self.handler.redirect(return_to)
+
+    def cleanup(self):
+        query = OAuthRequestToken.all().filter(
+            'created <', datetime.now() - EXPIRATION_WINDOW
+            )
+        count = query.count(CLEANUP_BATCH_SIZE)
+        db.delete(query.fetch(CLEANUP_BATCH_SIZE))
+        return "Cleaned %i entries" % count
+
+    # request marshalling
+
+    def get_data_from_signed_url(self, __url, __token=None, __meth='GET', **extra_params):
+	
+        return urlfetch(self.get_signed_url(
+            __url, __token, __meth, **extra_params
+            )).content
+
+    def get_signed_url(self, __url, __token=None, __meth='GET',**extra_params):
+        return '%s?%s'%(__url, self.get_signed_body(__url, __token, __meth, **extra_params))
+
+    def get_signed_body(self, __url, __token=None, __meth='GET',**extra_params):
+
+        service_info = self.service_info
+
+        kwargs = {
+            'oauth_consumer_key': service_info['consumer_key'],
+            'oauth_signature_method': 'HMAC-SHA1',
+            'oauth_version': '1.0',
+            'oauth_timestamp': int(time()),
+            'oauth_nonce': getrandbits(64),
+            }
+
+        kwargs.update(extra_params)
+
+        if self.service_key is None:
+            self.service_key = get_service_key(self.service)
+
+        if __token is not None:
+            kwargs['oauth_token'] = __token.oauth_token
+            key = self.service_key + encode(__token.oauth_token_secret)
+        else:
+            key = self.service_key
+
+        message = '&'.join(map(encode, [
+            __meth.upper(), __url, '&'.join(
+                '%s=%s' % (encode(k), encode(kwargs[k])) for k in sorted(kwargs)
+                )
+            ]))
+
+        kwargs['oauth_signature'] = hmac(
+            key, message, sha1
+            ).digest().encode('base64')[:-1]
+
+        return urlencode(kwargs)
+
+    # who stole the cookie from the cookie jar?
+
+    def get_cookie(self):
+        return self.handler.request.cookies.get(
+            'oauth.%s' % self.service, ''
+            )
+
+    def set_cookie(self, value, path='/'):
+        self.handler.response.headers.add_header(
+            'Set-Cookie',
+            '%s=%s; path=%s; expires="Fri, 31-Dec-2021 23:59:59 GMT"' %
+            ('oauth.%s' % self.service, value, path)
+            )
+
+    def expire_cookie(self, path='/'):
+        self.handler.response.headers.add_header(
+            'Set-Cookie',
+            '%s=; path=%s; expires="Fri, 31-Dec-1999 23:59:59 GMT"' %
+            ('oauth.%s' % self.service, path)
+            )
+
+# ------------------------------------------------------------------------------
+# oauth handler
+# ------------------------------------------------------------------------------
+
+class OAuthHandler(RequestHandler):
+
+    def get(self, service, action=''):
+
+        if service not in OAUTH_APP_SETTINGS:
+            return self.response.out.write(
+                "Unknown OAuth Service Provider: %r" % service
+                )
+
+        client = OAuthClient(service, self)
+
+        if action in client.__public__:
+            self.response.out.write(getattr(client, action)())
+        else:
+            self.response.out.write(client.login())
+
+# ------------------------------------------------------------------------------
+# modify this demo MainHandler to suit your needs
+# ------------------------------------------------------------------------------
+
+HEADER = """
+<html><head><title>Twitter OAuth Demo</title>
+</head><body>
+<h1>Twitter OAuth Demo App</h1>
 """
 
-  if service == "twitter":
-    return TwitterClient(key, secret, callback_url)
-  elif service == "yahoo":
-    return YahooClient(key, secret, callback_url)
-  elif service == "myspace":
-    return MySpaceClient(key, secret, callback_url)
-  else:
-    raise Exception, "Unknown OAuth service %s" % service
-
-
-class AuthToken(db.Model):
-  """Auth Token.
-
-A temporary auth token that we will use to authenticate a user with a
-third party website. (We need to store the data while the user visits
-the third party website to authenticate themselves.)
-
-TODO: Implement a cron to clean out old tokens periodically.
-"""
-
-  service = db.StringProperty(required=True)
-  token = db.StringProperty(required=True)
-  secret = db.StringProperty(required=True)
-  created = db.DateTimeProperty(auto_now_add=True)
-
-
-class OAuthClient():
-
-  def __init__(self, service_name, consumer_key, consumer_secret, request_url,
-               access_url, callback_url=None):
-    """ Constructor."""
-
-    self.service_name = service_name
-    self.consumer_key = consumer_key
-    self.consumer_secret = consumer_secret
-    self.request_url = request_url
-    self.access_url = access_url
-    self.callback_url = callback_url
-
-  def prepare_request(self, url, token="", secret="", additional_params=None,
-                      method=urlfetch.GET):
-    """Prepare Request.
-
-Prepares an authenticated request to any OAuth protected resource.
-
-Returns the payload of the request.
-"""
-
-    def encode(text):
-      return urlquote(str(text), "")
-
-    params = {
-      "oauth_consumer_key": self.consumer_key,
-      "oauth_signature_method": "HMAC-SHA1",
-      "oauth_timestamp": str(int(time())),
-      "oauth_nonce": str(getrandbits(64)),
-      "oauth_version": "1.0"
-    }
-
-    if token:
-      params["oauth_token"] = token
-    elif self.callback_url:
-      params["oauth_callback"] = self.callback_url
-
-    if additional_params:
-        params.update(additional_params)
-
-    for k,v in params.items():
-        if isinstance(v, unicode):
-            params[k] = v.encode('utf8')
-
-    # Join all of the params together.
-    params_str = "&".join(["%s=%s" % (encode(k), encode(params[k]))
-                           for k in sorted(params)])
-
-    # Join the entire message together per the OAuth specification.
-    message = "&".join(["GET" if method == urlfetch.GET else "POST",
-                        encode(url), encode(params_str)])
-
-    # Create a HMAC-SHA1 signature of the message.
-    key = "%s&%s" % (self.consumer_secret, secret) # Note compulsory "&".
-    signature = hmac(key, message, sha1)
-    digest_base64 = signature.digest().encode("base64").strip()
-    params["oauth_signature"] = digest_base64
-
-    # Construct the request payload and return it
-    return urlencode(params)
-    
-    
-  def make_async_request(self, url, token="", secret="", additional_params=None,
-                   protected=False, method=urlfetch.GET):
-    """Make Request.
-
-Make an authenticated request to any OAuth protected resource.
-
-If protected is equal to True, the Authorization: OAuth header will be set.
-
-A urlfetch response object is returned.
-"""
-    payload = self.prepare_request(url, token, secret, additional_params,
-                                   method)
-    if method == urlfetch.GET:
-        url = "%s?%s" % (url, payload)
-        payload = None
-    headers = {"Authorization": "OAuth"} if protected else {}
-    rpc = urlfetch.create_rpc(deadline=10.0)
-    urlfetch.make_fetch_call(rpc, url, method=method, headers=headers, payload=payload)
-    return rpc
-
-  def make_request(self, url, token="", secret="", additional_params=None,
-                                      protected=False, method=urlfetch.GET):
-    return self.make_async_request(url, token, secret, additional_params, protected, method).get_result()
-  
-  def get_authorization_url(self):
-    """Get Authorization URL.
-
-Returns a service specific URL which contains an auth token. The user
-should be redirected to this URL so that they can give consent to be
-logged in.
-"""
-
-    raise NotImplementedError, "Must be implemented by a subclass"
-
-  def get_user_info(self, auth_token, auth_verifier=""):
-    """Get User Info.
-
-Exchanges the auth token for an access token and returns a dictionary
-of information about the authenticated user.
-"""
-
-    auth_token = urlunquote(auth_token)
-    auth_verifier = urlunquote(auth_verifier)
+FOOTER = "</body></html>"
 
-    auth_secret = memcache.get(self._get_memcache_auth_key(auth_token))
-
-    if not auth_secret:
-      result = AuthToken.gql("""
-WHERE
-service = :1 AND
-token = :2
-LIMIT
-1
-""", self.service_name, auth_token).get()
-
-      if not result:
-        logging.error("The auth token %s was not found in our db" % auth_token)
-        raise Exception, "Could not find Auth Token in database"
-      else:
-        auth_secret = result.secret
-
-    response = self.make_request(self.access_url,
-                                token=auth_token,
-                                secret=auth_secret,
-                                additional_params={"oauth_verifier":
-                                                    auth_verifier})
+class MainHandler(RequestHandler):
+    """Demo Twitter App."""
 
-    # Extract the access token/secret from the response.
-    result = self._extract_credentials(response)
+    def get(self):
 
-    # Try to collect some information about this user from the service.
-    user_info = self._lookup_user_info(result["token"], result["secret"])
-    user_info.update(result)
-
-    return user_info
-
-  def _get_auth_token(self):
-    """Get Authorization Token.
-
-Actually gets the authorization token and secret from the service. The
-token and secret are stored in our database, and the auth token is
-returned.
-"""
+        client = OAuthClient('twitter', self)
+        gdata = OAuthClient('google', self, scope='http://www.google.com/calendar/feeds')
 
-    response = self.make_request(self.request_url)
-    result = self._extract_credentials(response)
+        write = self.response.out.write; write(HEADER)
 
-    auth_token = result["token"]
-    auth_secret = result["secret"]
+        if not client.get_cookie():
+            write('<a href="/oauth/twitter/login">Login via Twitter</a>')
+            write(FOOTER)
+            return
 
-    # Save the auth token and secret in our database.
-    auth = AuthToken(service=self.service_name,
-                     token=auth_token,
-                     secret=auth_secret)
-    auth.put()
+        write('<a href="/oauth/twitter/logout">Logout from Twitter</a><br /><br />')
 
-    # Add the secret to memcache as well.
-    memcache.set(self._get_memcache_auth_key(auth_token), auth_secret,
-                 time=20*60)
+        info = client.get('/account/verify_credentials')
 
-    return auth_token
+        write("<strong>Screen Name:</strong> %s<br />" % info['screen_name'])
+        write("<strong>Location:</strong> %s<br />" % info['location'])
 
-  def _get_memcache_auth_key(self, auth_token):
+        rate_info = client.get('/account/rate_limit_status')
 
-    return "oauth_%s_%s" % (self.service_name, auth_token)
+        write("<strong>API Rate Limit Status:</strong> %r" % rate_info)
 
-  def _extract_credentials(self, result):
-    """Extract Credentials.
+        write(FOOTER)
 
-Returns an dictionary containing the token and secret (if present).
-Throws an Exception otherwise.
-"""
+# ------------------------------------------------------------------------------
+# self runner -- gae cached main() function
+# ------------------------------------------------------------------------------
 
-    token = None
-    secret = None
-    parsed_results = parse_qs(result.content)
+def main():
 
-    if "oauth_token" in parsed_results:
-      token = parsed_results["oauth_token"][0]
+    application = WSGIApplication([
+       ('/oauth/(.*)/(.*)', OAuthHandler),
+       ('/', MainHandler)
+       ], debug=True)
 
-    if "oauth_token_secret" in parsed_results:
-      secret = parsed_results["oauth_token_secret"][0]
+    CGIHandler().run(application)
+# -------------------------------------------------------------------------------
+# who has tweeted after an epoch
+# -------------------------------------------------------------------------------
+def who_since(epoch):
+    """Get a list of users who have tweeted since a time epoch"""
+    # plan: use the since GET param and get stream
+    # page tweets 100 at a time
+    #
+    # get all subscriptions
+    # find intersection
+    # return list(dict(fullname, service, url, status, geo-lat, geo-lons))
+    service = 'twitter'
+    client = OAuthClient('twitter', RequestHandler)
 
-    if not (token and secret) or result.status_code != 200:
-      logging.error("Could not extract token/secret: %s" % result.content)
-      raise OAuthException("Problem talking to the service")
+    stream = client.get('/statuses/timeline.json?count=100&since=%s' % str(epoch))
 
-    return {
-      "service": self.service_name,
-      "token": token,
-      "secret": secret
-    }
+    while len(stream)>=100:
+        more = client.get('/statuses/timeline.json?count=100&since_id=%s' % str(stream[0]['id']))
+        stream = more + stream
+        if not more or len(more)<100:
+            break
+    ok = {}
+    for tweet in stream:
+        if not ok.has_key(tweet['user']['uri']):
+            ok[tweet['user']['uri']] = (tweet['user']['name'], tweet['content'])
+    return ok
 
-  def _lookup_user_info(self, access_token, access_secret):
-    """Lookup User Info.
-
-Complies a dictionary describing the user. The user should be
-authenticated at this point. Each different client should override
-this method.
-"""
-
-    raise NotImplementedError, "Must be implemented by a subclass"
-
-  def _get_default_user_info(self):
-    """Get Default User Info.
-
-Returns a blank array that can be used to populate generalized user
-information.
-"""
-
-    return {
-      "id": "",
-      "username": "",
-      "name": "",
-      "picture": ""
-    }
-
-
-class TwitterClient(OAuthClient):
-  """Twitter Client.
-
-A client for talking to the Twitter API using OAuth as the
-authentication model.
-"""
-
-  def __init__(self, consumer_key, consumer_secret, callback_url):
-    """Constructor."""
-
-    OAuthClient.__init__(self,
-        "twitter",
-        consumer_key,
-        consumer_secret,
-        "http://twitter.com/oauth/request_token",
-        "http://twitter.com/oauth/access_token",
-        callback_url)
-
-  def get_authorization_url(self):
-    """Get Authorization URL."""
-
-    token = self._get_auth_token()
-    return "http://twitter.com/oauth/authorize?oauth_token=%s" % token
-
-  def _lookup_user_info(self, access_token, access_secret):
-    """Lookup User Info.
-
-Lookup the user on Twitter.
-"""
-
-    response = self.make_request(
-        "http://twitter.com/account/verify_credentials.json",
-        token=access_token, secret=access_secret, protected=True)
-
-    data = json.loads(response.content)
-
-    user_info = self._get_default_user_info()
-    user_info["id"] = data["id"]
-    user_info["username"] = data["screen_name"]
-    user_info["name"] = data["name"]
-    user_info["picture"] = data["profile_image_url"]
-
-    return user_info
-
-
-class MySpaceClient(OAuthClient):
-  """MySpace Client.
-
-A client for talking to the MySpace API using OAuth as the
-authentication model.
-"""
-
-  def __init__(self, consumer_key, consumer_secret, callback_url):
-    """Constructor."""
-
-    OAuthClient.__init__(self,
-        "myspace",
-        consumer_key,
-        consumer_secret,
-        "http://api.myspace.com/request_token",
-        "http://api.myspace.com/access_token",
-        callback_url)
-
-  def get_authorization_url(self):
-    """Get Authorization URL."""
-
-    token = self._get_auth_token()
-    return ("http://api.myspace.com/authorize?oauth_token=%s"
-            "&oauth_callback=%s" % (token, urlquote(self.callback_url)))
-
-  def _lookup_user_info(self, access_token, access_secret):
-    """Lookup User Info.
-
-Lookup the user on MySpace.
-"""
-
-    response = self.make_request("http://api.myspace.com/v1/user.json",
-        token=access_token, secret=access_secret, protected=True)
-
-    data = json.loads(response.content)
-
-    user_info = self._get_default_user_info()
-    user_info["id"] = data["userId"]
-    username = data["webUri"].replace("http://www.myspace.com/", "")
-    user_info["username"] = username
-    user_info["name"] = data["name"]
-    user_info["picture"] = data["image"]
-
-    return user_info
-
-
-class YahooClient(OAuthClient):
-  """Yahoo! Client.
-
-A client for talking to the Yahoo! API using OAuth as the
-authentication model.
-"""
-
-  def __init__(self, consumer_key, consumer_secret, callback_url):
-    """Constructor."""
-
-    OAuthClient.__init__(self,
-        "yahoo",
-        consumer_key,
-        consumer_secret,
-        "https://api.login.yahoo.com/oauth/v2/get_request_token",
-        "https://api.login.yahoo.com/oauth/v2/get_token",
-        callback_url)
-
-  def get_authorization_url(self):
-    """Get Authorization URL."""
-
-    token = self._get_auth_token()
-    return ("https://api.login.yahoo.com/oauth/v2/request_auth?oauth_token=%s"
-            % token)
-
-  def _lookup_user_info(self, access_token, access_secret):
-    """Lookup User Info.
-
-Lookup the user on Yahoo!
-"""
-
-    user_info = self._get_default_user_info()
-
-    # 1) Obtain the user's GUID.
-    response = self.make_request(
-        "http://social.yahooapis.com/v1/me/guid", token=access_token,
-        secret=access_secret, additional_params={"format": "json"},
-        protected=True)
-
-    data = json.loads(response.content)["guid"]
-    guid = data["value"]
-
-    # 2) Inspect the user's profile.
-    response = self.make_request(
-        "http://social.yahooapis.com/v1/user/%s/profile/usercard" % guid,
-         token=access_token, secret=access_secret,
-         additional_params={"format": "json"}, protected=True)
-
-    data = json.loads(response.content)["profile"]
-
-    user_info["id"] = guid
-    user_info["username"] = data["nickname"].lower()
-    user_info["name"] = data["nickname"]
-    user_info["picture"] = data["image"]["imageUrl"]
-
-    return user_info
-
-
+if __name__ == '__main__':
+    main()

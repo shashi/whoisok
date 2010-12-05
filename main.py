@@ -12,8 +12,6 @@ from google.appengine.api import users
 from google.appengine.ext import webapp
 from google.appengine.ext.webapp import template
 
-from appengine_utilities import *
-
 # OAuth
 import twitter_oauth
 import facebook_oauth
@@ -29,10 +27,15 @@ class MainPage(webapp.RequestHandler):
     self.response.out.write(template.render(
       'templates/home.html', {}))
 
+class WhoIsOkHandler(webapp.RequestHandler):
+  def get(self):
+    pass
+
 application = webapp.WSGIApplication([
   ('/', MainPage),
-  ('/auth_twitter', twitter_oauth.LoginHandler),
-  ('/auth_facebook', facebook_oauth.LoginHandler)
+  (r'/oauth/(.*)/(.*)', twitter_oauth.OAuthHandler),
+  ('/oauth/facebook', facebook_oauth.LoginHandler),
+  ('/whoisok', WhoIsOkHandler)
 ], debug=True)
 
 

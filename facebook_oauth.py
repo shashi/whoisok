@@ -125,7 +125,7 @@ def set_cookie(response, name, value, domain=None, path="/", expires=None):
     if domain: cookie[name]["domain"] = domain
     if expires:
         cookie[name]["expires"] = email.utils.formatdate(
-            expires, localtime=False, usegmt=True)FACEBOOK_APP_ID
+            expires, localtime=False, usegmt=True)
     response.headers._headers.append(("Set-Cookie", cookie.output()[12:]))
 
 
@@ -145,7 +145,6 @@ def parse_cookie(value):
         return base64.b64decode(parts[0]).strip()
     except:
         return None
-
 
 def cookie_signature(*parts):
     """Generates a cookie signature.
